@@ -1,0 +1,13 @@
+# Vagrant
+.vagrant/
+*.log
+
+# Windows
+Thumbs.db
+*.Zone.Identifier
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
