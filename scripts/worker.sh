@@ -8,8 +8,9 @@ set -euo pipefail
 #
 # Estratégia de descoberta do Control Plane:
 # 1. Resolve hostname "control-plane"
-# 2. Scan na porta 6443 da subnet
-# 3. Se nenhum funcionar, exibe instruções para join manual
+# 2. IP via rota padrão (gateway adjacente)
+# 3. Scan na porta 6443 (IPs próximos primeiro)
+# 4. Se nenhum funcionar, exibe instruções para join manual
 
 echo "============================================"
 echo " Configurando Worker Node: $(hostname)"
@@ -34,20 +35,37 @@ CONTROL_PLANE_IP=""
 # Método 1: Resolver hostname
 if ping -c 1 -W 2 control-plane > /dev/null 2>&1; then
   CONTROL_PLANE_IP=$(getent hosts control-plane | awk '{print $1}')
-  echo ">>> Resolvido via hostname: ${CONTROL_PLANE_IP}"
+  if [ -n "$CONTROL_PLANE_IP" ]; then
+    echo ">>> Resolvido via hostname: ${CONTROL_PLANE_IP}"
+  fi
 fi
 
-# Método 2: Scan na porta 6443
+# Método 2: Scan otimizado na porta 6443 (IPs próximos primeiro)
 if [ -z "$CONTROL_PLANE_IP" ]; then
   echo ">>> Hostname não resolveu. Buscando API Server (porta 6443)..."
 
-  MY_IP=$(ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+  MY_IP=$(ip -4 addr show eth0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1 || \
+          ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\d+(\.\d+){3}' | head -1)
   SUBNET=$(echo "$MY_IP" | cut -d. -f1-3)
+  MY_LAST_OCTET=$(echo "$MY_IP" | cut -d. -f4)
 
+  # Scan inteligente: começa pelos IPs próximos ao worker (geralmente o control-plane
+  # está com IP menor, pois foi criado antes)
+  SCAN_ORDER=""
+  for offset in $(seq 1 20); do
+    lower=$((MY_LAST_OCTET - offset))
+    upper=$((MY_LAST_OCTET + offset))
+    [ "$lower" -ge 1 ] && SCAN_ORDER="$SCAN_ORDER $lower"
+    [ "$upper" -le 254 ] && [ "$upper" -ne "$MY_LAST_OCTET" ] && SCAN_ORDER="$SCAN_ORDER $upper"
+  done
+  # Adicionar o restante
   for i in $(seq 1 254); do
-    TARGET="${SUBNET}.${i}"
-    [ "$TARGET" = "$MY_IP" ] && continue
+    [ "$i" -eq "$MY_LAST_OCTET" ] && continue
+    echo "$SCAN_ORDER" | grep -qw "$i" 2>/dev/null || SCAN_ORDER="$SCAN_ORDER $i"
+  done
 
+  for i in $SCAN_ORDER; do
+    TARGET="${SUBNET}.${i}"
     if timeout 1 bash -c "echo > /dev/tcp/${TARGET}/6443" 2>/dev/null; then
       CONTROL_PLANE_IP="$TARGET"
       echo ">>> API Server encontrado: ${CONTROL_PLANE_IP}"
@@ -75,8 +93,13 @@ echo ">>> Obtendo join command..."
 
 JOIN_CMD=""
 
-# Tentar SSH com senha padrão do Vagrant
-if command -v sshpass &> /dev/null || apt-get install -y -qq sshpass > /dev/null 2>&1; then
+# Instalar sshpass temporariamente para obter o join command
+SSHPASS_INSTALLED=false
+if ! command -v sshpass &> /dev/null; then
+  apt-get install -y -qq sshpass > /dev/null 2>&1 && SSHPASS_INSTALLED=true
+fi
+
+if command -v sshpass &> /dev/null; then
   JOIN_CMD=$(sshpass -p 'vagrant' ssh \
     -o StrictHostKeyChecking=no \
     -o ConnectTimeout=5 \
@@ -85,13 +108,28 @@ if command -v sshpass &> /dev/null || apt-get install -y -qq sshpass > /dev/null
     vagrant@${CONTROL_PLANE_IP} "cat /home/vagrant/join-command.sh" 2>/dev/null || true)
 fi
 
-if [ -n "$JOIN_CMD" ] && echo "$JOIN_CMD" | grep -q "kubeadm join"; then
-  echo ">>> Join command obtido. Executando join..."
-  eval "sudo $JOIN_CMD --ignore-preflight-errors=Mem"
+# Remover sshpass se foi instalado apenas para este script
+if [ "$SSHPASS_INSTALLED" = true ]; then
+  apt-get remove -y -qq sshpass > /dev/null 2>&1 || true
+fi
+
+# Validar formato do join command antes de executar
+if [ -n "$JOIN_CMD" ] && echo "$JOIN_CMD" | grep -qP '^kubeadm join \d+\.\d+\.\d+\.\d+:\d+ --token \S+ --discovery-token-ca-cert-hash sha256:\S+$'; then
+  echo ">>> Join command válido. Executando join..."
+  $JOIN_CMD --ignore-preflight-errors=Mem
 
   echo ""
   echo "============================================"
   echo " Worker $(hostname) adicionado ao cluster!"
+  echo "============================================"
+elif [ -n "$JOIN_CMD" ]; then
+  echo "============================================"
+  echo " ERRO: Join command com formato inesperado. Abortando por segurança."
+  echo " Conteúdo recebido: ${JOIN_CMD}"
+  echo ""
+  echo " Join manual necessário:"
+  echo "   1. vagrant ssh control-plane -c \"cat /home/vagrant/join-command.sh\""
+  echo "   2. vagrant ssh $(hostname) -c \"sudo <comando-copiado>\""
   echo "============================================"
 else
   echo "============================================"
@@ -104,4 +142,4 @@ else
 fi
 
 echo ""
-echo ">>> Worker $(hostname) - IP: $(ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)"
+echo ">>> Worker $(hostname) - IP: $(ip -4 addr show eth0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' || echo 'N/A')"

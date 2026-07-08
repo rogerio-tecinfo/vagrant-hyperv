@@ -16,9 +16,24 @@ echo " Inicializando Control Plane"
 echo "============================================"
 
 # -------------------------------------------
-# 1. Detectar IP da máquina
+# 1. Detectar IP da máquina (multi-interface)
 # -------------------------------------------
-CONTROL_PLANE_IP=$(ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+# Tenta eth0 primeiro, depois qualquer interface não-loopback
+CONTROL_PLANE_IP=""
+
+# Tentar interfaces comuns no Hyper-V
+for iface in eth0 ens33 enp0s1 enp0s3; do
+  CONTROL_PLANE_IP=$(ip -4 addr show "$iface" 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1 || true)
+  if [ -n "$CONTROL_PLANE_IP" ]; then
+    echo ">>> Interface detectada: ${iface}"
+    break
+  fi
+done
+
+# Fallback: pegar o IP da rota padrão
+if [ -z "$CONTROL_PLANE_IP" ]; then
+  CONTROL_PLANE_IP=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\d+(\.\d+){3}' | head -1 || true)
+fi
 
 if [ -z "$CONTROL_PLANE_IP" ]; then
   echo "ERRO: Não foi possível detectar o IP do control-plane."
@@ -77,16 +92,29 @@ kubectl --kubeconfig=/etc/kubernetes/admin.conf wait \
 # -------------------------------------------
 # 5. Gerar comando de join para os workers
 # -------------------------------------------
-echo ">>> Gerando token de join para os workers..."
+# Só gera novo token se o arquivo não existe ou se o token expirou
+REGENERATE_TOKEN=false
 
-JOIN_COMMAND=$(kubeadm token create --print-join-command)
+if [ ! -f /home/vagrant/join-command.sh ]; then
+  REGENERATE_TOKEN=true
+elif ! kubeadm token list 2>/dev/null | grep -q "system:bootstrappers"; then
+  REGENERATE_TOKEN=true
+fi
 
-# Salvar o comando de join
-echo "${JOIN_COMMAND}" > /etc/kubernetes/join-command.sh
-chmod 644 /etc/kubernetes/join-command.sh
+if [ "$REGENERATE_TOKEN" = true ]; then
+  echo ">>> Gerando token de join para os workers..."
+  JOIN_COMMAND=$(kubeadm token create --print-join-command)
 
-echo "${JOIN_COMMAND}" > /home/vagrant/join-command.sh
-chown vagrant:vagrant /home/vagrant/join-command.sh
+  echo "${JOIN_COMMAND}" > /etc/kubernetes/join-command.sh
+  chmod 600 /etc/kubernetes/join-command.sh
+
+  echo "${JOIN_COMMAND}" > /home/vagrant/join-command.sh
+  chmod 600 /home/vagrant/join-command.sh
+  chown vagrant:vagrant /home/vagrant/join-command.sh
+else
+  echo ">>> Token de join ainda válido. Reutilizando..."
+  JOIN_COMMAND=$(cat /home/vagrant/join-command.sh)
+fi
 
 # -------------------------------------------
 # 6. Health check

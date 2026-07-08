@@ -35,6 +35,7 @@ BOX_IMAGE = "generic/ubuntu2204"
 
 Vagrant.configure("2") do |config|
   config.vm.synced_folder ".", "/vagrant", disabled: true
+  config.vm.boot_timeout = 600  # 10 min - VMs com 1GB podem demorar
 
   # ============================================================
   # Control Plane

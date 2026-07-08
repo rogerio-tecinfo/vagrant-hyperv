@@ -43,9 +43,18 @@ sysctl --system > /dev/null 2>&1
 # -------------------------------------------
 # 2. Instalar containerd
 # -------------------------------------------
-if command -v containerd &> /dev/null && containerd --version | grep -q "${CONTAINERD_VERSION%%"-"*}"; then
-  echo ">>> containerd já instalado. Pulando..."
-else
+CONTAINERD_INSTALLED=false
+
+if command -v containerd &> /dev/null; then
+  INSTALLED_VERSION=$(containerd --version | grep -oP '\d+\.\d+\.\d+' | head -1)
+  EXPECTED_VERSION="${CONTAINERD_VERSION%%-*}"
+  if [ "$INSTALLED_VERSION" = "$EXPECTED_VERSION" ]; then
+    echo ">>> containerd ${INSTALLED_VERSION} já instalado. Pulando..."
+    CONTAINERD_INSTALLED=true
+  fi
+fi
+
+if [ "$CONTAINERD_INSTALLED" = false ]; then
   echo ">>> Instalando containerd ${CONTAINERD_VERSION}..."
 
   apt-get update -qq
@@ -70,25 +79,34 @@ else
   apt-get update -qq
   apt-get install -y -qq "containerd.io=${CONTAINERD_VERSION}"
   apt-mark hold containerd.io
+
+  # Configurar containerd para usar systemd cgroup driver (somente na instalação)
+  mkdir -p /etc/containerd
+  containerd config default > /etc/containerd/config.toml
+  sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+
+  systemctl restart containerd
+  systemctl enable containerd
+else
+  # Apenas garantir que está habilitado e rodando (sem restart)
+  systemctl enable containerd
+  if ! systemctl is-active --quiet containerd; then
+    systemctl start containerd
+  fi
 fi
-
-# Configurar containerd para usar systemd cgroup driver (idempotente)
-mkdir -p /etc/containerd
-containerd config default > /etc/containerd/config.toml
-sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-
-systemctl restart containerd
-systemctl enable containerd
 
 echo ">>> containerd OK."
 
 # -------------------------------------------
 # 3. Instalar kubeadm, kubelet e kubectl
 # -------------------------------------------
-if command -v kubeadm &> /dev/null && kubeadm version -o short | grep -q "v${K8S_VERSION}"; then
+if command -v kubeadm &> /dev/null && [ "$(kubeadm version -o short)" = "v${K8S_VERSION}" ] 2>/dev/null; then
   echo ">>> kubeadm já instalado ($(kubeadm version -o short)). Pulando..."
 else
   echo ">>> Instalando kubeadm, kubelet e kubectl v${K8S_VERSION}..."
+
+  # Instalar dependências se necessário
+  apt-get install -y -qq curl apt-transport-https ca-certificates gnupg 2>/dev/null
 
   install -m 0755 -d /etc/apt/keyrings
   curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${K8S_VERSION}/deb/Release.key" -o /tmp/k8s.gpg
