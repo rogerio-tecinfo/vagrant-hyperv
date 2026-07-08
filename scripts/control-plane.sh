@@ -5,6 +5,11 @@ set -euo pipefail
 # - Inicializa o cluster com kubeadm init
 # - Instala CNI (Calico)
 # - Gera token de join para os workers
+#
+# IDEMPOTENTE: detecta se o cluster já foi inicializado
+
+CALICO_VERSION="v3.27.0"
+POD_CIDR="192.168.0.0/16"
 
 echo "============================================"
 echo " Inicializando Control Plane"
@@ -13,7 +18,6 @@ echo "============================================"
 # -------------------------------------------
 # 1. Detectar IP da máquina
 # -------------------------------------------
-# No Hyper-V, o IP é atribuído via DHCP
 CONTROL_PLANE_IP=$(ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
 
 if [ -z "$CONTROL_PLANE_IP" ]; then
@@ -28,25 +32,27 @@ echo ">>> IP do Control Plane: ${CONTROL_PLANE_IP}"
 # -------------------------------------------
 # 2. Inicializar o cluster (kubeadm init)
 # -------------------------------------------
-echo ">>> Executando kubeadm init..."
+if [ -f /etc/kubernetes/admin.conf ]; then
+  echo ">>> Cluster já inicializado. Pulando kubeadm init..."
+else
+  echo ">>> Executando kubeadm init..."
 
-kubeadm init \
-  --apiserver-advertise-address="${CONTROL_PLANE_IP}" \
-  --pod-network-cidr=192.168.0.0/16 \
-  --node-name="control-plane" \
-  --ignore-preflight-errors=Mem,NumCPU
+  kubeadm init \
+    --apiserver-advertise-address="${CONTROL_PLANE_IP}" \
+    --pod-network-cidr="${POD_CIDR}" \
+    --node-name="control-plane" \
+    --ignore-preflight-errors=Mem,NumCPU
 
-echo ">>> kubeadm init concluído."
+  echo ">>> kubeadm init concluído."
+fi
 
 # -------------------------------------------
 # 3. Configurar kubectl para o usuário vagrant
 # -------------------------------------------
 echo ">>> Configurando kubectl para o usuário vagrant..."
 
-# Para root
 export KUBECONFIG=/etc/kubernetes/admin.conf
 
-# Para o usuário vagrant
 mkdir -p /home/vagrant/.kube
 cp -f /etc/kubernetes/admin.conf /home/vagrant/.kube/config
 chown -R vagrant:vagrant /home/vagrant/.kube
@@ -54,16 +60,19 @@ chown -R vagrant:vagrant /home/vagrant/.kube
 echo ">>> kubectl configurado."
 
 # -------------------------------------------
-# 4. Instalar CNI - Calico
+# 4. Instalar CNI - Calico (idempotente - kubectl apply)
 # -------------------------------------------
-echo ">>> Instalando Calico CNI..."
+echo ">>> Aplicando Calico CNI ${CALICO_VERSION}..."
 
-kubectl --kubeconfig=/etc/kubernetes/admin.conf apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/calico.yaml
+kubectl --kubeconfig=/etc/kubernetes/admin.conf apply \
+  -f "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/calico.yaml"
 
-echo ">>> Calico instalado. Aguardando pods ficarem prontos..."
+echo ">>> Calico aplicado. Aguardando pods ficarem prontos..."
 
-# Aguardar o Calico estar ready (timeout de 120s)
-kubectl --kubeconfig=/etc/kubernetes/admin.conf wait --for=condition=Ready pods --all -n kube-system --timeout=120s || true
+# Aguardar os pods do kube-system (timeout de 180s)
+kubectl --kubeconfig=/etc/kubernetes/admin.conf wait \
+  --for=condition=Ready pods --all \
+  -n kube-system --timeout=180s || true
 
 # -------------------------------------------
 # 5. Gerar comando de join para os workers
@@ -72,25 +81,33 @@ echo ">>> Gerando token de join para os workers..."
 
 JOIN_COMMAND=$(kubeadm token create --print-join-command)
 
-# Salvar o comando de join em um arquivo acessível
+# Salvar o comando de join
 echo "${JOIN_COMMAND}" > /etc/kubernetes/join-command.sh
 chmod 644 /etc/kubernetes/join-command.sh
 
-# Salvar também no home do vagrant para fácil acesso
 echo "${JOIN_COMMAND}" > /home/vagrant/join-command.sh
 chown vagrant:vagrant /home/vagrant/join-command.sh
+
+# -------------------------------------------
+# 6. Health check
+# -------------------------------------------
+echo ""
+echo ">>> Verificando saúde do cluster..."
+echo ""
+kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes -o wide
+echo ""
+kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system
+echo ""
 
 echo "============================================"
 echo " Control Plane inicializado com sucesso!"
 echo "============================================"
 echo ""
-echo " IP do Control Plane: ${CONTROL_PLANE_IP}"
-echo " Comando de join salvo em: /home/vagrant/join-command.sh"
+echo " IP: ${CONTROL_PLANE_IP}"
+echo " Join command: /home/vagrant/join-command.sh"
+echo " Calico: ${CALICO_VERSION}"
+echo " Pod CIDR: ${POD_CIDR}"
 echo ""
-echo " Para os workers se juntarem ao cluster, execute:"
+echo " Comando de join para os workers:"
 echo " ${JOIN_COMMAND}"
-echo ""
-echo " Verificar o cluster:"
-echo "   vagrant ssh control-plane"
-echo "   kubectl get nodes"
 echo "============================================"

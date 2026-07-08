@@ -73,6 +73,33 @@ vagrant ssh control-plane
 ```bash
 kubectl get nodes
 kubectl get pods -A
+
+# Health check completo
+bash /home/vagrant/validate-cluster.sh
+```
+
+### Reprovisioning (idempotente)
+
+Os scripts podem ser executados múltiplas vezes sem efeitos colaterais:
+
+```powershell
+# Re-executar toda a configuração (não recria as VMs)
+vagrant provision
+
+# Apenas no control-plane
+vagrant provision control-plane
+```
+
+Se precisar reinicializar o cluster do zero:
+
+```powershell
+# Reset antes de reprovisionar
+vagrant ssh control-plane -c "sudo kubeadm reset -f"
+vagrant ssh worker-1 -c "sudo kubeadm reset -f"
+vagrant ssh worker-2 -c "sudo kubeadm reset -f"
+
+# Re-provisionar
+vagrant provision
 ```
 
 ### Join manual dos workers (se necessário)
@@ -124,12 +151,15 @@ vagrant destroy worker-1 -f && vagrant up worker-1 --provider=hyperv
 
 ```
 .
-├── Vagrantfile              # Definição das 3 VMs
+├── Vagrantfile              # Definição das 3 VMs (configurações centralizadas)
 ├── README.md                # Este arquivo
+├── docs/
+│   └── topology.png         # Diagrama da topologia
 └── scripts/
     ├── common.sh            # Pré-requisitos + containerd + kubeadm (todas as VMs)
     ├── control-plane.sh     # kubeadm init + Calico (somente control-plane)
-    └── worker.sh            # kubeadm join (somente workers)
+    ├── worker.sh            # kubeadm join (somente workers)
+    └── validate-cluster.sh  # Health check do cluster
 ```
 
 ## Observações sobre Hyper-V + Kubernetes
