@@ -22,7 +22,7 @@ O cluster usa **duas interfaces** por VM, separando os planos de tráfego:
 
 | Interface | Switch                  | Faixa            | Uso |
 |-----------|-------------------------|------------------|-----|
-| `eth0`    | Default Switch (DHCP)   | dinâmica         | **Management** — SSH / Vagrant |
+| `eth0`    | LOCAL_NETWORK (DHCP)    | dinâmica         | **Management** — SSH / Vagrant |
 | `eth1`    | K8sSwitch (Internal)    | 172.30.0.0/24    | **Cluster** — API server (6443), kubelet, join |
 
 - **Pod CIDR:** `10.244.0.0/16` (Calico) — sem sobreposição com a rede de nós nem com o Service CIDR.
@@ -54,16 +54,21 @@ Reiniciar após a instalação.
 
 https://developer.hashicorp.com/vagrant/install
 
-### 3. Criar o switch interno do cluster (obrigatório)
+### 3. Switches virtuais (obrigatório)
 
-O plano de cluster usa um switch **Internal** com IPs fixos (`172.30.0.0/24`). Crie-o uma vez, como Administrador:
+O cluster usa **dois** vSwitches:
+
+- **`LOCAL_NETWORK`** — management (eth0). vSwitch **já existente** no host, com saída para a internet (DHCP). É definido em `MGMT_SWITCH` no Vagrantfile.
+- **`K8sSwitch`** — plano de cluster (eth1), **Internal** com IPs fixos (`172.30.0.0/24`). Crie-o uma vez, como Administrador:
 
 ```powershell
 New-VMSwitch -SwitchName "K8sSwitch" -SwitchType Internal
 New-NetIPAddress -IPAddress 172.30.0.1 -PrefixLength 24 -InterfaceAlias "vEthernet (K8sSwitch)"
 ```
 
-> O host fica em `172.30.0.1`; as VMs usam `.10`, `.11`, `.12` (ver Vagrantfile). Sem NAT — a `eth0` (Default Switch) continua provendo saída para a internet.
+> O host fica em `172.30.0.1`; as VMs usam `.10`, `.11`, `.12` (ver Vagrantfile). A `eth0` (LOCAL_NETWORK) provê saída para a internet.
+>
+> Se o seu vSwitch de management tiver outro nome, ajuste `MGMT_SWITCH` no Vagrantfile.
 
 ### 4. Verificar
 
@@ -83,7 +88,7 @@ cd <caminho-do-projeto>
 vagrant up --provider=hyperv
 ```
 
-Selecione o **Default Switch** quando perguntado.
+As interfaces já vêm fixadas nos vSwitches (`LOCAL_NETWORK` e `K8sSwitch`) — sem prompt de seleção.
 
 O provisioning executa automaticamente:
 1. Configura o IP fixo do plano de cluster (eth1 / K8sSwitch) via netplan
@@ -198,10 +203,10 @@ vagrant destroy worker-1 -f && vagrant up worker-1 --provider=hyperv
 ## Observações sobre Hyper-V + Kubernetes
 
 ### Rede (segregação de planos)
-- **eth0** (Default Switch/DHCP) = management: SSH/Vagrant e saída para a internet.
+- **eth0** (LOCAL_NETWORK/DHCP) = management: SSH/Vagrant e saída para a internet.
 - **eth1** (K8sSwitch/Internal, `172.30.0.0/24`, estático) = plano de cluster: API server, kubelet e join.
 - O `node-ip` do kubelet é fixado na eth1 (`--node-ip`), garantindo que o `InternalIP` dos nós fique na rede de cluster.
-- **Pod CIDR:** `10.244.0.0/16` (Calico, alinhado ao `--pod-network-cidr`). Evita a colisão que ocorria com `192.168.0.0/16` vs. a faixa do Default Switch.
+- **Pod CIDR:** `10.244.0.0/16` (Calico, alinhado ao `--pod-network-cidr`). Evita a colisão que ocorria com `192.168.0.0/16` vs. a faixa do vSwitch de management.
 - **Service CIDR:** `10.96.0.0/12` (padrão do kubeadm).
 
 ### Descoberta do Control Plane (determinística)

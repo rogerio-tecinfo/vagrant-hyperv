@@ -22,7 +22,7 @@ echo "============================================"
 # -------------------------------------------
 # 0. Rede do plano de cluster (IP fixo em eth1)
 # -------------------------------------------
-# Segrega o tráfego: eth0 (Default Switch/DHCP) = management/SSH,
+# Segrega o tráfego: eth0 (LOCAL_NETWORK/DHCP) = management/SSH,
 # eth1 (K8sSwitch/estático) = tráfego de cluster (API server, kubelet, join).
 if [ -n "$CLUSTER_IP" ]; then
   echo ">>> Configurando IP fixo ${CLUSTER_IP}/${CLUSTER_NETMASK} em ${CLUSTER_IFACE}..."

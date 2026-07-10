@@ -20,10 +20,11 @@
 K8S_VERSION = "1.30"
 
 # --- Segregação de rede ---------------------------------------------------
-# eth0  -> Default Switch (DHCP)  : plano de MANAGEMENT (SSH/Vagrant)
+# eth0  -> LOCAL_NETWORK (DHCP)   : plano de MANAGEMENT (SSH/Vagrant)
 # eth1  -> K8sSwitch (Internal)   : plano de CLUSTER (API server, kubelet, join)
 #
 # IPs fixos no switch interno eliminam o port-scan e o sshpass no join.
+MGMT_SWITCH = "LOCAL_NETWORK"      # vSwitch de management (eth0) - já existente no host
 CLUSTER_SWITCH = "K8sSwitch"       # switch interno criado no host (ver README)
 CLUSTER_NETMASK = "24"
 # Token de bootstrap fixo (lab). Formato: [a-z0-9]{6}.[a-z0-9]{16}
@@ -56,7 +57,9 @@ Vagrant.configure("2") do |config|
     master.vm.box = BOX_IMAGE
     master.vm.hostname = CONTROL_PLANE[:hostname]
 
-    # NIC do plano de cluster (switch interno)
+    # NIC de management (eth0) - vSwitch LOCAL_NETWORK
+    master.vm.network "public_network", bridge: MGMT_SWITCH
+    # NIC do plano de cluster (eth1) - switch interno
     master.vm.network "private_network", bridge: CLUSTER_SWITCH
 
     master.vm.provider "hyperv" do |hv|
@@ -85,7 +88,9 @@ Vagrant.configure("2") do |config|
       worker.vm.box = BOX_IMAGE
       worker.vm.hostname = worker_config[:hostname]
 
-      # NIC do plano de cluster (switch interno)
+      # NIC de management (eth0) - vSwitch LOCAL_NETWORK
+      worker.vm.network "public_network", bridge: MGMT_SWITCH
+      # NIC do plano de cluster (eth1) - switch interno
       worker.vm.network "private_network", bridge: CLUSTER_SWITCH
 
       worker.vm.provider "hyperv" do |hv|

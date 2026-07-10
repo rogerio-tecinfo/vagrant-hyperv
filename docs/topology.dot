@@ -15,7 +15,7 @@ digraph k8s_topology {
 
   // ---------- Switches ----------
   mgmt_sw [shape=box, style="filled", fillcolor="#f0b429", fontcolor="#1f2933",
-           label="Default Switch (DHCP)\nPlano de MANAGEMENT — eth0\nSSH / Vagrant"];
+           label="LOCAL_NETWORK (DHCP)\nPlano de MANAGEMENT — eth0\nSSH / Vagrant"];
   clus_sw [shape=box, style="filled", fillcolor="#3ebd93", fontcolor="#1f2933",
            label="K8sSwitch (Internal, estático)\nPlano de CLUSTER — eth1\n172.30.0.0/24 — API/kubelet/join"];
 
