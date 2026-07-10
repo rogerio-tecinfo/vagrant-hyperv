@@ -7,13 +7,43 @@ set -euo pipefail
 # IDEMPOTENTE: pode ser executado múltiplas vezes sem efeitos colaterais
 
 K8S_VERSION="${1:-1.30}"
+CLUSTER_IP="${2:-}"          # IP fixo no plano de cluster (eth1)
+CLUSTER_NETMASK="${3:-24}"
+CLUSTER_IFACE="eth1"         # NIC ligada ao switch interno K8sSwitch
 CONTAINERD_VERSION="1.7.22-1"
 K8S_PATCH_VERSION="1.30.14-1.1"
 
 echo "============================================"
 echo " Configurando pré-requisitos do Kubernetes"
 echo " K8s: v${K8S_VERSION} | Containerd: ${CONTAINERD_VERSION}"
+echo " Cluster IP: ${CLUSTER_IP:-<none>} (${CLUSTER_IFACE})"
 echo "============================================"
+
+# -------------------------------------------
+# 0. Rede do plano de cluster (IP fixo em eth1)
+# -------------------------------------------
+# Segrega o tráfego: eth0 (Default Switch/DHCP) = management/SSH,
+# eth1 (K8sSwitch/estático) = tráfego de cluster (API server, kubelet, join).
+if [ -n "$CLUSTER_IP" ]; then
+  echo ">>> Configurando IP fixo ${CLUSTER_IP}/${CLUSTER_NETMASK} em ${CLUSTER_IFACE}..."
+
+  cat <<EOF > /etc/netplan/99-k8s-cluster.yaml
+network:
+  version: 2
+  ethernets:
+    ${CLUSTER_IFACE}:
+      dhcp4: false
+      addresses:
+        - ${CLUSTER_IP}/${CLUSTER_NETMASK}
+EOF
+  chmod 600 /etc/netplan/99-k8s-cluster.yaml
+  netplan apply 2>/dev/null || echo ">>> AVISO: netplan apply falhou (interface ${CLUSTER_IFACE} presente?)."
+
+  # Fixar o node-ip do kubelet na rede de cluster (evita usar o IP DHCP da eth0)
+  if ! grep -q "node-ip=${CLUSTER_IP}" /etc/default/kubelet 2>/dev/null; then
+    echo "KUBELET_EXTRA_ARGS=--node-ip=${CLUSTER_IP}" > /etc/default/kubelet
+  fi
+fi
 
 # -------------------------------------------
 # 1. Configurações básicas do sistema

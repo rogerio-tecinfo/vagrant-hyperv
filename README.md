@@ -8,11 +8,26 @@ Cluster Kubernetes automatizado com 1 Control Plane + 2 Worker Nodes no Hyper-V 
 
 ## Cenário
 
-| VM            | Função         | CPU | RAM    | Componentes |
-|---------------|----------------|-----|--------|-------------|
-| control-plane | Control Plane  | 2   | 1024MB | kubeadm, kubelet, kubectl, containerd, Calico, etcd, API Server |
-| worker-1      | Worker Node    | 2   | 1024MB | kubeadm, kubelet, containerd, Calico |
-| worker-2      | Worker Node    | 2   | 1024MB | kubeadm, kubelet, containerd, Calico |
+| VM            | Função         | CPU | RAM    | IP (cluster / eth1) | Componentes |
+|---------------|----------------|-----|--------|---------------------|-------------|
+| control-plane | Control Plane  | 2   | 1024MB | 172.30.0.10         | kubeadm, kubelet, kubectl, containerd, Calico, etcd, API Server |
+| worker-1      | Worker Node    | 2   | 1024MB | 172.30.0.11         | kubeadm, kubelet, containerd, Calico |
+| worker-2      | Worker Node    | 2   | 1024MB | 172.30.0.12         | kubeadm, kubelet, containerd, Calico |
+
+> RAM fixada em **1024MB por VM**. O control-plane fica abaixo do mínimo oficial do kubeadm (~1.7GB), por isso o `kubeadm init` usa `--ignore-preflight-errors=Mem`.
+
+### Segregação de rede
+
+O cluster usa **duas interfaces** por VM, separando os planos de tráfego:
+
+| Interface | Switch                  | Faixa            | Uso |
+|-----------|-------------------------|------------------|-----|
+| `eth0`    | Default Switch (DHCP)   | dinâmica         | **Management** — SSH / Vagrant |
+| `eth1`    | K8sSwitch (Internal)    | 172.30.0.0/24    | **Cluster** — API server (6443), kubelet, join |
+
+- **Pod CIDR:** `10.244.0.0/16` (Calico) — sem sobreposição com a rede de nós nem com o Service CIDR.
+- **Service CIDR:** `10.96.0.0/12` (padrão kubeadm).
+- **NetworkPolicies:** modelo *default-deny* no namespace `default` + liberação explícita de DNS (`manifests/network-policies.yaml`).
 
 ## Stack
 
@@ -39,7 +54,18 @@ Reiniciar após a instalação.
 
 https://developer.hashicorp.com/vagrant/install
 
-### 3. Verificar
+### 3. Criar o switch interno do cluster (obrigatório)
+
+O plano de cluster usa um switch **Internal** com IPs fixos (`172.30.0.0/24`). Crie-o uma vez, como Administrador:
+
+```powershell
+New-VMSwitch -SwitchName "K8sSwitch" -SwitchType Internal
+New-NetIPAddress -IPAddress 172.30.0.1 -PrefixLength 24 -InterfaceAlias "vEthernet (K8sSwitch)"
+```
+
+> O host fica em `172.30.0.1`; as VMs usam `.10`, `.11`, `.12` (ver Vagrantfile). Sem NAT — a `eth0` (Default Switch) continua provendo saída para a internet.
+
+### 4. Verificar
 
 ```powershell
 vagrant --version
@@ -60,12 +86,14 @@ vagrant up --provider=hyperv
 Selecione o **Default Switch** quando perguntado.
 
 O provisioning executa automaticamente:
-1. Configura pré-requisitos do sistema (swap, módulos, sysctl)
-2. Instala containerd 1.7.22 com systemd cgroup driver
-3. Instala kubeadm, kubelet e kubectl v1.30.14
-4. Inicializa o cluster no control-plane (`kubeadm init`)
-5. Instala o CNI Calico v3.27.0
-6. Workers fazem join automaticamente (scan de rede + SSH)
+1. Configura o IP fixo do plano de cluster (eth1 / K8sSwitch) via netplan
+2. Configura pré-requisitos do sistema (swap, módulos, sysctl)
+3. Instala containerd 1.7.22 com systemd cgroup driver
+4. Instala kubeadm, kubelet e kubectl v1.30.14
+5. Inicializa o cluster no control-plane (`kubeadm init` com Pod CIDR `10.244.0.0/16`)
+6. Instala o CNI Calico v3.27.0 (alinhado ao Pod CIDR)
+7. Aplica as NetworkPolicies (default-deny + allow DNS)
+8. Workers fazem join de forma determinística (IP fixo `172.30.0.10` + token fixo, sem scan/SSH)
 
 ### Verificar o cluster
 
@@ -117,23 +145,13 @@ vagrant provision
 
 ### Join manual dos workers (se necessário)
 
-Como o Hyper-V usa DHCP, o join automático pode falhar. Nesse caso:
+Com IP fixo (`172.30.0.10`) e token fixo, o join é determinístico. Se precisar refazê-lo manualmente:
 
 ```powershell
-# 1. Obter o comando de join
-vagrant ssh control-plane -c "cat /home/vagrant/join-command.sh"
-
-# 2. Executar no worker
-vagrant ssh worker-1 -c "sudo kubeadm join <IP>:6443 --token <token> --discovery-token-ca-cert-hash <hash>"
-vagrant ssh worker-2 -c "sudo kubeadm join <IP>:6443 --token <token> --discovery-token-ca-cert-hash <hash>"
+vagrant ssh worker-1 -c "sudo kubeadm join 172.30.0.10:6443 --token k8slab.0123456789abcdef --discovery-token-unsafe-skip-ca-verification"
 ```
 
-### Se o token expirar (24h)
-
-```bash
-# No control-plane
-kubeadm token create --print-join-command
-```
+> O token de bootstrap é definido no Vagrantfile (`JOIN_TOKEN`) e criado com `--token-ttl 0` (não expira), evitando o problema de expiração em 24h.
 
 ## Comandos úteis
 
@@ -160,42 +178,48 @@ vagrant destroy worker-1 -f && vagrant up worker-1 --provider=hyperv
 
 ```
 .
-├── Vagrantfile              # Definição das 3 VMs (configurações centralizadas)
-├── README.md                # Este arquivo
+├── Vagrantfile                  # Definição das 3 VMs + rede/switch/token (centralizado)
+├── README.md                    # Este arquivo
 ├── docs/
-│   └── topology.png         # Diagrama da topologia
+│   ├── topology.dot             # Fonte Graphviz da topologia
+│   └── topology.png             # Diagrama da topologia (gerado do .dot)
+├── manifests/
+│   └── network-policies.yaml    # NetworkPolicies (default-deny + allow DNS)
 └── scripts/
-    ├── common.sh            # Pré-requisitos + containerd + kubeadm (todas as VMs)
-    ├── control-plane.sh     # kubeadm init + Calico (somente control-plane)
-    ├── worker.sh            # kubeadm join (somente workers)
-    └── validate-cluster.sh  # Health check do cluster
+    ├── common.sh                # IP fixo (eth1) + pré-requisitos + containerd + kubeadm
+    ├── control-plane.sh         # kubeadm init + Calico + NetworkPolicies (control-plane)
+    ├── worker.sh                # kubeadm join determinístico (workers)
+    └── validate-cluster.sh      # Health check do cluster
 ```
+
+> Para regenerar a imagem da topologia após editar o `.dot`:
+> `dot -Tpng -Gdpi=120 docs/topology.dot -o docs/topology.png`
 
 ## Observações sobre Hyper-V + Kubernetes
 
-### Rede
-- O Hyper-V atribui IPs via DHCP (Default Switch). Não há IPs estáticos via Vagrant.
-- O script detecta automaticamente o IP da VM em múltiplas interfaces (eth0, ens33, enp0s1) com fallback via `ip route`.
-- O Calico gerencia a rede de pods (CIDR: 192.168.0.0/16).
-- Service CIDR: 10.96.0.0/12 (padrão do kubeadm).
+### Rede (segregação de planos)
+- **eth0** (Default Switch/DHCP) = management: SSH/Vagrant e saída para a internet.
+- **eth1** (K8sSwitch/Internal, `172.30.0.0/24`, estático) = plano de cluster: API server, kubelet e join.
+- O `node-ip` do kubelet é fixado na eth1 (`--node-ip`), garantindo que o `InternalIP` dos nós fique na rede de cluster.
+- **Pod CIDR:** `10.244.0.0/16` (Calico, alinhado ao `--pod-network-cidr`). Evita a colisão que ocorria com `192.168.0.0/16` vs. a faixa do Default Switch.
+- **Service CIDR:** `10.96.0.0/12` (padrão do kubeadm).
 
-### Descoberta automática do Control Plane
+### Descoberta do Control Plane (determinística)
 
-Os workers descobrem o control-plane automaticamente:
-1. Tentam resolver o hostname `control-plane`
-2. Fazem scan otimizado na porta 6443 (IPs próximos primeiro)
-3. Obtêm o join command via SSH (senha padrão do Vagrant)
-4. Validam o formato do comando antes de executar
+Com IP fixo e token fixo, os workers não fazem mais scan de rede nem SSH:
+1. Aguardam o API Server responder em `172.30.0.10:6443` (retry).
+2. Executam `kubeadm join` com o token de bootstrap fixo.
+3. Isso remove o antigo mecanismo de `port-scan` + `sshpass` (senha em claro / sem verificação de host key).
 
-### Para IPs fixos (recomendado para produção)
+> **Trade-off (lab):** o join usa `--discovery-token-unsafe-skip-ca-verification`, aceitável em rede interna isolada. Em produção, use o `--discovery-token-ca-cert-hash` real.
 
-Crie um switch interno no Windows:
+### NetworkPolicies
 
-```powershell
-New-VMSwitch -SwitchName "K8sSwitch" -SwitchType Internal
-New-NetIPAddress -IPAddress 172.89.0.1 -PrefixLength 24 -InterfaceAlias "vEthernet (K8sSwitch)"
-New-NetNat -Name "K8sNAT" -InternalIPInterfaceAddressPrefix "172.89.0.0/24"
-```
+`manifests/network-policies.yaml` aplica no namespace `default`:
+- `default-deny-all` — bloqueia todo ingress/egress por padrão.
+- `allow-dns-egress` — libera DNS (UDP/TCP 53) para o CoreDNS.
+
+Replique o padrão em cada namespace de workload, liberando apenas o necessário (menor privilégio). O `kube-system` não é afetado.
 
 ### Troubleshooting
 
