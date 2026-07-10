@@ -2,17 +2,20 @@
 set -euo pipefail
 
 # Script executado SOMENTE nos Worker Nodes
-# - Faz join no cluster Kubernetes usando o token do control-plane
+# - Faz join no cluster Kubernetes usando IP fixo do control-plane + token fixo
 #
 # IDEMPOTENTE: verifica se já fez join antes de tentar novamente
 #
-# Estratégia de descoberta do Control Plane:
-# 1. Resolve hostname "control-plane"
-# 2. Scan na porta 6443 da subnet
-# 3. Se nenhum funcionar, exibe instruções para join manual
+# Com IPs fixos no switch interno (K8sSwitch) e token de bootstrap fixo,
+# o join é determinístico: NÃO há mais port-scan de rede nem sshpass.
+
+CONTROL_PLANE_IP="${1:-}"   # IP fixo do control-plane (plano de cluster / eth1)
+JOIN_TOKEN="${2:-}"          # token de bootstrap fixo (lab)
+API_PORT="6443"
 
 echo "============================================"
 echo " Configurando Worker Node: $(hostname)"
+echo " Control Plane: ${CONTROL_PLANE_IP:-<none>}:${API_PORT}"
 echo "============================================"
 
 # -------------------------------------------
@@ -24,84 +27,46 @@ if [ -f /etc/kubernetes/kubelet.conf ]; then
   exit 0
 fi
 
-# -------------------------------------------
-# 1. Descobrir o Control Plane
-# -------------------------------------------
-echo ">>> Descobrindo o Control Plane na rede..."
-
-CONTROL_PLANE_IP=""
-
-# Método 1: Resolver hostname
-if ping -c 1 -W 2 control-plane > /dev/null 2>&1; then
-  CONTROL_PLANE_IP=$(getent hosts control-plane | awk '{print $1}')
-  echo ">>> Resolvido via hostname: ${CONTROL_PLANE_IP}"
-fi
-
-# Método 2: Scan na porta 6443
-if [ -z "$CONTROL_PLANE_IP" ]; then
-  echo ">>> Hostname não resolveu. Buscando API Server (porta 6443)..."
-
-  MY_IP=$(ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
-  SUBNET=$(echo "$MY_IP" | cut -d. -f1-3)
-
-  for i in $(seq 1 254); do
-    TARGET="${SUBNET}.${i}"
-    [ "$TARGET" = "$MY_IP" ] && continue
-
-    if timeout 1 bash -c "echo > /dev/tcp/${TARGET}/6443" 2>/dev/null; then
-      CONTROL_PLANE_IP="$TARGET"
-      echo ">>> API Server encontrado: ${CONTROL_PLANE_IP}"
-      break
-    fi
-  done
+if [ -z "$CONTROL_PLANE_IP" ] || [ -z "$JOIN_TOKEN" ]; then
+  echo "ERRO: CONTROL_PLANE_IP e JOIN_TOKEN são obrigatórios (definidos no Vagrantfile)."
+  exit 1
 fi
 
 # -------------------------------------------
-# 2. Fazer join no cluster
+# 1. Aguardar o API Server do control-plane ficar acessível
 # -------------------------------------------
-if [ -z "$CONTROL_PLANE_IP" ]; then
+echo ">>> Aguardando API Server em ${CONTROL_PLANE_IP}:${API_PORT}..."
+API_READY=false
+for attempt in $(seq 1 30); do
+  if timeout 2 bash -c "echo > /dev/tcp/${CONTROL_PLANE_IP}/${API_PORT}" 2>/dev/null; then
+    API_READY=true
+    echo ">>> API Server acessível (tentativa ${attempt})."
+    break
+  fi
+  sleep 10
+done
+
+if [ "$API_READY" = false ]; then
   echo "============================================"
-  echo " ATENÇÃO: Control Plane não encontrado."
-  echo ""
-  echo " Join manual necessário:"
-  echo "   1. vagrant ssh control-plane -c \"cat /home/vagrant/join-command.sh\""
-  echo "   2. vagrant ssh $(hostname) -c \"sudo <comando-copiado>\""
+  echo " ATENÇÃO: API Server não respondeu em ${CONTROL_PLANE_IP}:${API_PORT}."
+  echo " Verifique se o control-plane subiu e se a NIC eth1 (K8sSwitch) está ativa."
   echo "============================================"
-  exit 0
+  exit 1
 fi
 
-echo ">>> Control Plane: ${CONTROL_PLANE_IP}"
-echo ">>> Obtendo join command..."
-
-JOIN_CMD=""
-
-# Tentar SSH com senha padrão do Vagrant
-if command -v sshpass &> /dev/null || apt-get install -y -qq sshpass > /dev/null 2>&1; then
-  JOIN_CMD=$(sshpass -p 'vagrant' ssh \
-    -o StrictHostKeyChecking=no \
-    -o ConnectTimeout=5 \
-    -o UserKnownHostsFile=/dev/null \
-    -o LogLevel=ERROR \
-    vagrant@${CONTROL_PLANE_IP} "cat /home/vagrant/join-command.sh" 2>/dev/null || true)
-fi
-
-if [ -n "$JOIN_CMD" ] && echo "$JOIN_CMD" | grep -q "kubeadm join"; then
-  echo ">>> Join command obtido. Executando join..."
-  eval "sudo $JOIN_CMD --ignore-preflight-errors=Mem"
-
-  echo ""
-  echo "============================================"
-  echo " Worker $(hostname) adicionado ao cluster!"
-  echo "============================================"
-else
-  echo "============================================"
-  echo " ATENÇÃO: Não foi possível obter o join command via SSH."
-  echo ""
-  echo " Join manual necessário:"
-  echo "   1. vagrant ssh control-plane -c \"cat /home/vagrant/join-command.sh\""
-  echo "   2. vagrant ssh $(hostname) -c \"sudo <comando-copiado>\""
-  echo "============================================"
-fi
+# -------------------------------------------
+# 2. Fazer join no cluster (token fixo, CA hash via token discovery)
+# -------------------------------------------
+# --discovery-token-unsafe-skip-ca-verification: aceitável em LAB isolado
+# (switch interno). Remove a necessidade do CA hash e de SSH ao control-plane.
+echo ">>> Executando kubeadm join..."
+kubeadm join "${CONTROL_PLANE_IP}:${API_PORT}" \
+  --token "${JOIN_TOKEN}" \
+  --discovery-token-unsafe-skip-ca-verification \
+  --ignore-preflight-errors=Mem
 
 echo ""
-echo ">>> Worker $(hostname) - IP: $(ip -4 addr show eth0 | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)"
+echo "============================================"
+echo " Worker $(hostname) adicionado ao cluster!"
+echo " IP (plano de cluster): $(ip -4 addr show eth1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' || echo 'N/A')"
+echo "============================================"

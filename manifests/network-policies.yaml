@@ -1,0 +1,48 @@
+# NetworkPolicies - Segregação de rede (boas práticas Kubernetes)
+#
+# Modelo "default-deny" aplicado ao namespace `default`:
+#   - Todo tráfego de ingress e egress é bloqueado por padrão.
+#   - Libera-se apenas o essencial (resolução DNS via CoreDNS).
+#
+# Para novos workloads, crie NetworkPolicies específicas liberando
+# somente as portas/origens necessárias (princípio do menor privilégio).
+#
+# OBS: Estas policies NÃO afetam o namespace kube-system (control plane,
+# CNI e CoreDNS continuam operando normalmente). Aplicar o mesmo padrão
+# a cada namespace de workload que você criar.
+---
+# 1. Nega todo ingress e egress no namespace default
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: default
+spec:
+  podSelector: {}          # aplica a todos os pods do namespace
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# 2. Libera egress de DNS (UDP/TCP 53) para o CoreDNS no kube-system
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: default
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

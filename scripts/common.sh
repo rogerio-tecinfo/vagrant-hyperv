@@ -7,13 +7,43 @@ set -euo pipefail
 # IDEMPOTENTE: pode ser executado múltiplas vezes sem efeitos colaterais
 
 K8S_VERSION="${1:-1.30}"
+CLUSTER_IP="${2:-}"          # IP fixo no plano de cluster (eth1)
+CLUSTER_NETMASK="${3:-24}"
+CLUSTER_IFACE="eth1"         # NIC ligada ao switch interno K8sSwitch
 CONTAINERD_VERSION="1.7.22-1"
 K8S_PATCH_VERSION="1.30.14-1.1"
 
 echo "============================================"
 echo " Configurando pré-requisitos do Kubernetes"
 echo " K8s: v${K8S_VERSION} | Containerd: ${CONTAINERD_VERSION}"
+echo " Cluster IP: ${CLUSTER_IP:-<none>} (${CLUSTER_IFACE})"
 echo "============================================"
+
+# -------------------------------------------
+# 0. Rede do plano de cluster (IP fixo em eth1)
+# -------------------------------------------
+# Segrega o tráfego: eth0 (Default Switch/DHCP) = management/SSH,
+# eth1 (K8sSwitch/estático) = tráfego de cluster (API server, kubelet, join).
+if [ -n "$CLUSTER_IP" ]; then
+  echo ">>> Configurando IP fixo ${CLUSTER_IP}/${CLUSTER_NETMASK} em ${CLUSTER_IFACE}..."
+
+  cat <<EOF > /etc/netplan/99-k8s-cluster.yaml
+network:
+  version: 2
+  ethernets:
+    ${CLUSTER_IFACE}:
+      dhcp4: false
+      addresses:
+        - ${CLUSTER_IP}/${CLUSTER_NETMASK}
+EOF
+  chmod 600 /etc/netplan/99-k8s-cluster.yaml
+  netplan apply 2>/dev/null || echo ">>> AVISO: netplan apply falhou (interface ${CLUSTER_IFACE} presente?)."
+
+  # Fixar o node-ip do kubelet na rede de cluster (evita usar o IP DHCP da eth0)
+  if ! grep -q "node-ip=${CLUSTER_IP}" /etc/default/kubelet 2>/dev/null; then
+    echo "KUBELET_EXTRA_ARGS=--node-ip=${CLUSTER_IP}" > /etc/default/kubelet
+  fi
+fi
 
 # -------------------------------------------
 # 1. Configurações básicas do sistema
@@ -43,9 +73,18 @@ sysctl --system > /dev/null 2>&1
 # -------------------------------------------
 # 2. Instalar containerd
 # -------------------------------------------
-if command -v containerd &> /dev/null && containerd --version | grep -q "${CONTAINERD_VERSION%%"-"*}"; then
-  echo ">>> containerd já instalado. Pulando..."
-else
+CONTAINERD_INSTALLED=false
+
+if command -v containerd &> /dev/null; then
+  INSTALLED_VERSION=$(containerd --version | grep -oP '\d+\.\d+\.\d+' | head -1)
+  EXPECTED_VERSION="${CONTAINERD_VERSION%%-*}"
+  if [ "$INSTALLED_VERSION" = "$EXPECTED_VERSION" ]; then
+    echo ">>> containerd ${INSTALLED_VERSION} já instalado. Pulando..."
+    CONTAINERD_INSTALLED=true
+  fi
+fi
+
+if [ "$CONTAINERD_INSTALLED" = false ]; then
   echo ">>> Instalando containerd ${CONTAINERD_VERSION}..."
 
   apt-get update -qq
@@ -70,25 +109,34 @@ else
   apt-get update -qq
   apt-get install -y -qq "containerd.io=${CONTAINERD_VERSION}"
   apt-mark hold containerd.io
+
+  # Configurar containerd para usar systemd cgroup driver (somente na instalação)
+  mkdir -p /etc/containerd
+  containerd config default > /etc/containerd/config.toml
+  sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+
+  systemctl restart containerd
+  systemctl enable containerd
+else
+  # Apenas garantir que está habilitado e rodando (sem restart)
+  systemctl enable containerd
+  if ! systemctl is-active --quiet containerd; then
+    systemctl start containerd
+  fi
 fi
-
-# Configurar containerd para usar systemd cgroup driver (idempotente)
-mkdir -p /etc/containerd
-containerd config default > /etc/containerd/config.toml
-sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-
-systemctl restart containerd
-systemctl enable containerd
 
 echo ">>> containerd OK."
 
 # -------------------------------------------
 # 3. Instalar kubeadm, kubelet e kubectl
 # -------------------------------------------
-if command -v kubeadm &> /dev/null && kubeadm version -o short | grep -q "v${K8S_VERSION}"; then
+if command -v kubeadm &> /dev/null && [ "$(kubeadm version -o short)" = "v${K8S_VERSION}" ] 2>/dev/null; then
   echo ">>> kubeadm já instalado ($(kubeadm version -o short)). Pulando..."
 else
   echo ">>> Instalando kubeadm, kubelet e kubectl v${K8S_VERSION}..."
+
+  # Instalar dependências se necessário
+  apt-get install -y -qq curl apt-transport-https ca-certificates gnupg 2>/dev/null
 
   install -m 0755 -d /etc/apt/keyrings
   curl -fsSL "https://pkgs.k8s.io/core:/stable:/v${K8S_VERSION}/deb/Release.key" -o /tmp/k8s.gpg
