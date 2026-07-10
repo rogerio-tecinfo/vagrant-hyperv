@@ -56,25 +56,47 @@ https://developer.hashicorp.com/vagrant/install
 
 ### 3. Switches virtuais (obrigatório)
 
-O cluster usa **dois** vSwitches:
+O cluster usa **dois** vSwitches. Execute o PowerShell **como Administrador**.
 
-- **`LOCAL_NETWORK`** — management (eth0). vSwitch **já existente** no host, com saída para a internet (DHCP). É definido em `MGMT_SWITCH` no Vagrantfile.
-- **`K8sSwitch`** — plano de cluster (eth1), **Internal** com IPs fixos (`172.30.0.0/24`). Crie-o uma vez, como Administrador:
+> Pods (`10.244.0.0/16`) e Services (`10.96.0.0/12`) **não** precisam de vSwitch — são redes virtuais internas do Kubernetes (Calico e kube-proxy), criadas em software sobre a rede de nós.
+
+#### 3.1 `LOCAL_NETWORK` — management (eth0)
+
+vSwitch **External**, ligado à sua placa física, provendo DHCP e saída para a internet. Descubra o nome do adaptador físico e crie o switch:
 
 ```powershell
-New-VMSwitch -SwitchName "K8sSwitch" -SwitchType Internal
+# Listar adaptadores físicos ativos (Wi-Fi ou Ethernet)
+Get-NetAdapter -Physical | Where-Object Status -eq "Up" | Format-Table Name, InterfaceDescription
+
+# Criar o switch External vinculado ao adaptador escolhido (ajuste -NetAdapterName)
+New-VMSwitch -Name "LOCAL_NETWORK" -NetAdapterName "Ethernet" -AllowManagementOS $true
+```
+
+> Se você já tem um vSwitch External para uso geral, pode reaproveitá-lo: basta ajustar `MGMT_SWITCH` no Vagrantfile para o nome dele (em vez de criar o `LOCAL_NETWORK`).
+
+#### 3.2 `K8sSwitch` — plano de cluster (eth1)
+
+vSwitch **Internal** com IPs fixos (`172.30.0.0/24`), isolado, só para o tráfego entre os nós:
+
+```powershell
+New-VMSwitch -Name "K8sSwitch" -SwitchType Internal
 New-NetIPAddress -IPAddress 172.30.0.1 -PrefixLength 24 -InterfaceAlias "vEthernet (K8sSwitch)"
 ```
 
-> O host fica em `172.30.0.1`; as VMs usam `.10`, `.11`, `.12` (ver Vagrantfile). A `eth0` (LOCAL_NETWORK) provê saída para a internet.
->
-> Se o seu vSwitch de management tiver outro nome, ajuste `MGMT_SWITCH` no Vagrantfile.
+> O host fica em `172.30.0.1`; as VMs usam `.10`, `.11`, `.12` (ver Vagrantfile).
+
+#### 3.3 Conferir
+
+```powershell
+Get-VMSwitch | Format-Table Name, SwitchType, NetAdapterInterfaceDescription
+```
+
+Deve listar `LOCAL_NETWORK` (External) e `K8sSwitch` (Internal).
 
 ### 4. Verificar
 
 ```powershell
 vagrant --version
-Get-VMSwitch
 ```
 
 ## Como usar
