@@ -34,7 +34,7 @@ CONTROL_PLANE = {
   name: "control-plane",
   hostname: "control-plane",
   cpus: 2,
-  memory: 1024,
+  memory: 2048,
   cluster_ip: "172.30.0.10"
 }
 

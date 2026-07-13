@@ -61,13 +61,13 @@ else
     --pod-network-cidr="${POD_CIDR}" \
     --node-name="control-plane" \
     ${TOKEN_ARGS} \
-    --ignore-preflight-errors=Mem,NumCPU
+    --ignore-preflight-errors=NumCPU
 
   echo ">>> kubeadm init concluído."
 fi
 
 # -------------------------------------------
-# 3. Configurar kubectl para o usuário vagrant
+# 3. Configurar kubectl para o usuário vagrant e root
 # -------------------------------------------
 echo ">>> Configurando kubectl para o usuário vagrant..."
 
@@ -77,7 +77,11 @@ mkdir -p /home/vagrant/.kube
 cp -f /etc/kubernetes/admin.conf /home/vagrant/.kube/config
 chown -R vagrant:vagrant /home/vagrant/.kube
 
-echo ">>> kubectl configurado."
+# Configurar também para root (sudo su)
+mkdir -p /root/.kube
+cp -f /etc/kubernetes/admin.conf /root/.kube/config
+
+echo ">>> kubectl configurado (vagrant + root)."
 
 # -------------------------------------------
 # 4. Instalar CNI - Calico (idempotente - kubectl apply)
@@ -130,18 +134,70 @@ chmod 600 /home/vagrant/join-command.sh
 chown vagrant:vagrant /home/vagrant/join-command.sh
 
 # -------------------------------------------
-# 6. Health check
+# 6. Validação do Control Plane
 # -------------------------------------------
 echo ""
-echo ">>> Verificando saúde do cluster..."
-echo ""
-kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes -o wide
-echo ""
-kubectl --kubeconfig=/etc/kubernetes/admin.conf get pods -n kube-system
+echo ">>> Validando provisionamento do Control Plane..."
 echo ""
 
+KC="kubectl --kubeconfig=/etc/kubernetes/admin.conf"
+VALIDATION_ERRORS=0
+
+validate() {
+  local desc="$1"
+  local cmd="$2"
+  if eval "$cmd" > /dev/null 2>&1; then
+    echo "  [OK] $desc"
+  else
+    echo "  [FALHOU] $desc"
+    ((VALIDATION_ERRORS++)) || true
+  fi
+}
+
+echo "--- API Server & etcd ---"
+validate "API Server respondendo" "curl -sk https://127.0.0.1:6443/healthz | grep -q ok"
+validate "etcd rodando" "$KC get pods -n kube-system -l component=etcd --field-selector=status.phase=Running --no-headers | grep -q ."
+validate "kube-apiserver rodando" "$KC get pods -n kube-system -l component=kube-apiserver --field-selector=status.phase=Running --no-headers | grep -q ."
+validate "kube-scheduler rodando" "$KC get pods -n kube-system -l component=kube-scheduler --field-selector=status.phase=Running --no-headers | grep -q ."
+validate "kube-controller-manager rodando" "$KC get pods -n kube-system -l component=kube-controller-manager --field-selector=status.phase=Running --no-headers | grep -q ."
+echo ""
+
+echo "--- CNI (Calico) ---"
+validate "calico-node rodando no control-plane" "$KC get pods -n kube-system -l k8s-app=calico-node --field-selector=status.phase=Running --no-headers | grep -q ."
+validate "calico-kube-controllers rodando" "$KC get pods -n kube-system -l k8s-app=calico-kube-controllers --field-selector=status.phase=Running --no-headers | grep -q ."
+validate "Pod CIDR atribuído ao node" "$KC get node control-plane -o jsonpath='{.spec.podCIDR}' | grep -q ."
+echo ""
+
+echo "--- CoreDNS & kube-proxy ---"
+validate "CoreDNS rodando" "$KC get pods -n kube-system -l k8s-app=kube-dns --field-selector=status.phase=Running --no-headers | grep -q ."
+validate "kube-proxy rodando" "$KC get pods -n kube-system -l k8s-app=kube-proxy --field-selector=status.phase=Running --no-headers | grep -q ."
+echo ""
+
+echo "--- Rede & Node ---"
+validate "Control Plane está Ready" "$KC get nodes control-plane | grep -q ' Ready'"
+validate "InternalIP é 172.30.0.10" "$KC get node control-plane -o jsonpath='{.status.addresses[?(@.type==\"InternalIP\")].address}' | grep -q '172.30.0.10'"
+validate "Service CIDR correto (10.96.x)" "$KC get svc kubernetes -o jsonpath='{.spec.clusterIP}' | grep -q '10.96'"
+echo ""
+
+echo "--- Token de join ---"
+validate "Token de bootstrap ativo" "$KC get secrets -n kube-system | grep -q bootstrap-token"
+echo ""
+
+echo "--- NetworkPolicies ---"
+validate "default-deny-all aplicada" "$KC get networkpolicy -n default 2>/dev/null | grep -q deny"
+validate "allow-dns-egress aplicada" "$KC get networkpolicy -n default 2>/dev/null | grep -q dns"
+echo ""
+
+# Resumo
 echo "============================================"
-echo " Control Plane inicializado com sucesso!"
+if [ $VALIDATION_ERRORS -eq 0 ]; then
+  echo " Control Plane: TODOS OS CHECKS PASSARAM"
+else
+  echo " Control Plane: ${VALIDATION_ERRORS} CHECK(S) FALHARAM"
+  echo ""
+  echo " Pods com problema:"
+  $KC get pods -A --no-headers | grep -v "Running" || echo "  (nenhum)"
+fi
 echo "============================================"
 echo ""
 echo " IP: ${CONTROL_PLANE_IP}"

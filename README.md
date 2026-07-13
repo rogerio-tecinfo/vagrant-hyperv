@@ -10,11 +10,11 @@ Cluster Kubernetes automatizado com 1 Control Plane + 2 Worker Nodes no Hyper-V 
 
 | VM            | Função         | CPU | RAM    | IP (cluster / eth1) | Componentes |
 |---------------|----------------|-----|--------|---------------------|-------------|
-| control-plane | Control Plane  | 2   | 1024MB | 172.30.0.10         | kubeadm, kubelet, kubectl, containerd, Calico, etcd, API Server |
+| control-plane | Control Plane  | 2   | 2048MB | 172.30.0.10         | kubeadm, kubelet, kubectl, containerd, Calico, etcd, API Server |
 | worker-1      | Worker Node    | 2   | 1024MB | 172.30.0.11         | kubeadm, kubelet, containerd, Calico |
 | worker-2      | Worker Node    | 2   | 1024MB | 172.30.0.12         | kubeadm, kubelet, containerd, Calico |
 
-> RAM fixada em **1024MB por VM**. O control-plane fica abaixo do mínimo oficial do kubeadm (~1.7GB), por isso o `kubeadm init` usa `--ignore-preflight-errors=Mem`.
+> Workers com **1024MB**. O control-plane usa **2048MB** para atender o mínimo do kubeadm (~1.7GB).
 
 ### Segregação de rede
 
