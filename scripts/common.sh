@@ -13,31 +13,44 @@ CONTAINERD_VERSION="1.7.22-1"
 K8S_PATCH_VERSION="1.30.14-1.1"
 
 # -------------------------------------------
-# Detectar a interface do plano de cluster (2ª NIC / K8sSwitch)
-# No Hyper-V, nomes podem variar (eth1, ens*, etc.)
-# Estratégia: a 2ª NIC é aquela SEM IP atribuído (a 1ª já tem DHCP).
+# Detectar interfaces de rede
+# -------------------------------------------
+# Neste ponto o fix-dhcp-identity.sh já rodou e o vagrant-reload já reiniciou
+# a VM com machine-id único + dhcp-identifier=mac. Cada VM tem IP DHCP próprio.
+#
+# Se já temos nosso netplan salvo, usamos a interface declarada lá.
+# Senão, detectamos pela presença de IP (management) ou ausência (cluster).
 # -------------------------------------------
 detect_cluster_iface() {
-  # Listar interfaces que NÃO são lo e NÃO têm endereço IPv4
+  if [ -f /etc/netplan/99-k8s-cluster.yaml ]; then
+    local saved_iface
+    saved_iface=$(grep -A1 'ethernets:' /etc/netplan/99-k8s-cluster.yaml | tail -1 | tr -d ' :')
+    if [ -n "$saved_iface" ] && [ -d "/sys/class/net/${saved_iface}" ]; then
+      echo "$saved_iface"
+      return
+    fi
+  fi
   local iface
-  for iface in $(ls /sys/class/net/ | grep -v lo); do
-    # Pular a interface que já tem IP (é a de management/DHCP)
+  for iface in $(ls /sys/class/net/ | grep -v lo | sort); do
     if ! ip -4 addr show "$iface" 2>/dev/null | grep -q "inet "; then
       echo "$iface"
       return
     fi
   done
-  # Fallback: tentar eth1
   echo "eth1"
 }
 
-CLUSTER_IFACE=$(detect_cluster_iface)
-
-# Detectar a interface de management (eth0 / LOCAL_NETWORK / DHCP):
-# é a que JÁ possui IPv4 e NÃO é a interface do plano de cluster.
 detect_mgmt_iface() {
+  if [ -f /etc/netplan/98-mgmt-static.yaml ]; then
+    local saved_iface
+    saved_iface=$(grep -A1 'ethernets:' /etc/netplan/98-mgmt-static.yaml | tail -1 | tr -d ' :')
+    if [ -n "$saved_iface" ] && [ -d "/sys/class/net/${saved_iface}" ]; then
+      echo "$saved_iface"
+      return
+    fi
+  fi
   local iface
-  for iface in $(ls /sys/class/net/ | grep -v lo); do
+  for iface in $(ls /sys/class/net/ | grep -v lo | sort); do
     [ "$iface" = "$CLUSTER_IFACE" ] && continue
     if ip -4 addr show "$iface" 2>/dev/null | grep -q "inet "; then
       echo "$iface"
@@ -46,42 +59,11 @@ detect_mgmt_iface() {
   done
   echo "eth0"
 }
+
+CLUSTER_IFACE=$(detect_cluster_iface)
 MGMT_IFACE=$(detect_mgmt_iface)
 
-# -------------------------------------------
-# Evitar IP duplicado no eth0 (management/DHCP)
-# -------------------------------------------
-# As VMs são linked clones da MESMA box, então herdam o mesmo /etc/machine-id.
-# O systemd-networkd usa, por padrão, dhcp-identifier=duid, e o DUID é derivado
-# do machine-id. machine-id igual => DUID igual => o servidor DHCP entrega a
-# MESMA lease para VMs diferentes (ex.: worker-1 e worker-2 com o mesmo IP em eth0).
-#
-# Defesa dupla (idempotente):
-#   1. Regenerar o machine-id (uma vez por VM) para dar identidade única.
-#   2. Forçar dhcp-identifier=mac no eth0. Como o Hyper-V atribui MAC único por
-#      adapter, a lease passa a ser determinística mesmo que o DUID coincida.
-#
-# Ambos passam a valer no PRÓXIMO boot da NIC (não fazemos 'netplan apply' aqui
-# para não derrubar o SSH/DNS da sessão de provisionamento atual).
-if [ ! -f /etc/machine-id.vagrant-regen ]; then
-  echo ">>> Regenerando machine-id (evita DUID/IP duplicado no eth0 entre clones)..."
-  : > /etc/machine-id
-  rm -f /var/lib/dbus/machine-id
-  systemd-machine-id-setup >/dev/null 2>&1 || true
-  ln -sf /etc/machine-id /var/lib/dbus/machine-id 2>/dev/null || true
-  touch /etc/machine-id.vagrant-regen
-fi
-
-echo ">>> Fixando dhcp-identifier=mac no ${MGMT_IFACE} (lease única por MAC)..."
-cat <<EOF > /etc/netplan/98-mgmt-dhcp-identifier.yaml
-network:
-  version: 2
-  ethernets:
-    ${MGMT_IFACE}:
-      dhcp4: true
-      dhcp-identifier: mac
-EOF
-chmod 600 /etc/netplan/98-mgmt-dhcp-identifier.yaml
+echo ">>> Interfaces detectadas: management=${MGMT_IFACE}, cluster=${CLUSTER_IFACE}"
 
 echo "============================================"
 echo " Configurando pré-requisitos do Kubernetes"
@@ -280,7 +262,7 @@ fi
 
 echo "============================================"
 echo " Pré-requisitos concluídos em: $(hostname)"
-echo " IP (management): $(ip -4 addr show eth0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' || echo 'N/A')"
+echo " IP (management): $(ip -4 addr show ${MGMT_IFACE} 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' || echo 'N/A')"
 echo " IP (cluster):    ${CLUSTER_IP:-N/A} (${CLUSTER_IFACE})"
 echo "============================================"
 
@@ -312,7 +294,7 @@ validate "br_netfilter carregado" "lsmod | grep -q br_netfilter"
 validate "overlay carregado" "lsmod | grep -q overlay"
 validate "ip_forward habilitado" "[ $(cat /proc/sys/net/ipv4/ip_forward) -eq 1 ]"
 validate "machine-id único regenerado" "test -f /etc/machine-id.vagrant-regen && test -s /etc/machine-id"
-validate "dhcp-identifier=mac no ${MGMT_IFACE}" "grep -q 'dhcp-identifier: mac' /etc/netplan/98-mgmt-dhcp-identifier.yaml 2>/dev/null"
+validate "IP estático no ${MGMT_IFACE}" "test -f /etc/netplan/98-mgmt-static.yaml"
 
 if [ -n "$CLUSTER_IP" ]; then
   validate "IP do cluster configurado (${CLUSTER_IFACE})" \
