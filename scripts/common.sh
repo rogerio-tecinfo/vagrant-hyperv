@@ -111,6 +111,32 @@ fi
 # -------------------------------------------
 echo ">>> Configurando sistema..."
 
+# Garantir que o DNS está funcional (systemd-resolved pode demorar a propagar
+# os nameservers do netplan após o reboot com IP estático)
+echo ">>> Verificando resolução DNS..."
+for attempt in $(seq 1 5); do
+  if host pkgs.k8s.io >/dev/null 2>&1 || nslookup pkgs.k8s.io >/dev/null 2>&1; then
+    echo "    DNS OK (tentativa ${attempt})"
+    break
+  fi
+  echo "    DNS não resolve ainda (tentativa ${attempt}/5). Reiniciando systemd-resolved..."
+  systemctl restart systemd-resolved 2>/dev/null || true
+  sleep 3
+done
+
+# Fallback: se systemd-resolved não funcionar, apontar direto para DNS externo
+if ! host pkgs.k8s.io >/dev/null 2>&1 && ! nslookup pkgs.k8s.io >/dev/null 2>&1; then
+  echo "    AVISO: DNS via systemd-resolved falhou. Configurando fallback direto..."
+  mkdir -p /etc/systemd/resolved.conf.d
+  cat <<EOF > /etc/systemd/resolved.conf.d/dns-fallback.conf
+[Resolve]
+DNS=8.8.8.8 8.8.4.4
+FallbackDNS=1.1.1.1
+EOF
+  systemctl restart systemd-resolved
+  sleep 2
+fi
+
 # Trocar mirror Ubuntu (mirrors.edge.kernel.org pode ser lento/instável)
 # Usar archive.ubuntu.com como fallback confiável
 if grep -q "mirrors.edge.kernel.org" /etc/apt/sources.list 2>/dev/null; then
