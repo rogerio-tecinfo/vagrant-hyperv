@@ -57,17 +57,46 @@ Vagrant.configure("2") do |config|
     master.vm.box = BOX_IMAGE
     master.vm.hostname = CONTROL_PLANE[:hostname]
 
-    # NIC de management (eth0) - vSwitch LOCAL_NETWORK
+    # NIC primária (eth0) vinculada ao switch de management (DHCP/internet/SSH)
     master.vm.network "public_network", bridge: MGMT_SWITCH
-    # NIC do plano de cluster (eth1) - switch interno
-    master.vm.network "private_network", bridge: CLUSTER_SWITCH
 
     master.vm.provider "hyperv" do |hv|
       hv.vmname = CONTROL_PLANE[:name]
       hv.cpus = CONTROL_PLANE[:cpus]
       hv.memory = CONTROL_PLANE[:memory]
+      hv.maxmemory = CONTROL_PLANE[:memory]
       hv.enable_virtualization_extensions = true
       hv.linked_clone = true
+    end
+
+    # Adicionar 2ª NIC (K8sSwitch) ANTES de iniciar a VM.
+    # O provider Hyper-V não suporta vm.network "private_network" para criar NICs extras.
+    # Usamos um action trigger que executa após a importação, antes do boot.
+    master.trigger.before :"VagrantPlugins::HyperV::Action::StartInstance", type: :action do |trigger|
+      trigger.info = "Adicionando NIC do cluster (#{CLUSTER_SWITCH}) em #{CONTROL_PLANE[:name]}..."
+      trigger.run = {
+        privileged: "true",
+        powershell_elevated_interactive: "true",
+        inline: <<-PS
+          $vmName = "#{CONTROL_PLANE[:name]}"
+          $switchName = "#{CLUSTER_SWITCH}"
+          # Criar switch interno se não existir
+          if (-not (Get-VMSwitch -Name $switchName -ErrorAction SilentlyContinue)) {
+            Write-Host "Criando switch interno '$switchName'..."
+            New-VMSwitch -Name $switchName -SwitchType Internal
+            $ifAlias = "vEthernet ($switchName)"
+            New-NetIPAddress -IPAddress 172.30.0.1 -PrefixLength 24 -InterfaceAlias $ifAlias -ErrorAction SilentlyContinue
+          }
+          # Adicionar NIC à VM
+          $adapter = Get-VM $vmName | Get-VMNetworkAdapter | Where-Object { $_.SwitchName -eq $switchName }
+          if ($null -eq $adapter) {
+            Write-Host "Adicionando NIC '$switchName' em '$vmName'..."
+            Add-VMNetworkAdapter -VMName $vmName -SwitchName $switchName -Name "Cluster"
+          } else {
+            Write-Host "NIC '$switchName' já existe em '$vmName'. Pulando."
+          }
+        PS
+      }
     end
 
     # common.sh recebe: versão do K8s + IP fixo do plano de cluster
@@ -88,17 +117,43 @@ Vagrant.configure("2") do |config|
       worker.vm.box = BOX_IMAGE
       worker.vm.hostname = worker_config[:hostname]
 
-      # NIC de management (eth0) - vSwitch LOCAL_NETWORK
       worker.vm.network "public_network", bridge: MGMT_SWITCH
-      # NIC do plano de cluster (eth1) - switch interno
-      worker.vm.network "private_network", bridge: CLUSTER_SWITCH
 
       worker.vm.provider "hyperv" do |hv|
         hv.vmname = worker_config[:name]
         hv.cpus = worker_config[:cpus]
         hv.memory = worker_config[:memory]
+        hv.maxmemory = worker_config[:memory]
         hv.enable_virtualization_extensions = true
         hv.linked_clone = true
+      end
+
+      # Adicionar 2ª NIC (K8sSwitch) antes do boot
+      worker.trigger.before :"VagrantPlugins::HyperV::Action::StartInstance", type: :action do |trigger|
+        trigger.info = "Adicionando NIC do cluster (#{CLUSTER_SWITCH}) em #{worker_config[:name]}..."
+        trigger.run = {
+          privileged: "true",
+          powershell_elevated_interactive: "true",
+          inline: <<-PS
+            $vmName = "#{worker_config[:name]}"
+            $switchName = "#{CLUSTER_SWITCH}"
+            # Criar switch interno se não existir
+            if (-not (Get-VMSwitch -Name $switchName -ErrorAction SilentlyContinue)) {
+              Write-Host "Criando switch interno '$switchName'..."
+              New-VMSwitch -Name $switchName -SwitchType Internal
+              $ifAlias = "vEthernet ($switchName)"
+              New-NetIPAddress -IPAddress 172.30.0.1 -PrefixLength 24 -InterfaceAlias $ifAlias -ErrorAction SilentlyContinue
+            }
+            # Adicionar NIC à VM
+            $adapter = Get-VM $vmName | Get-VMNetworkAdapter | Where-Object { $_.SwitchName -eq $switchName }
+            if ($null -eq $adapter) {
+              Write-Host "Adicionando NIC '$switchName' em '$vmName'..."
+              Add-VMNetworkAdapter -VMName $vmName -SwitchName $switchName -Name "Cluster"
+            } else {
+              Write-Host "NIC '$switchName' já existe em '$vmName'. Pulando."
+            }
+          PS
+        }
       end
 
       worker.vm.provision "shell", path: "scripts/common.sh",
