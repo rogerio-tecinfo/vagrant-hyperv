@@ -117,6 +117,8 @@ vagrant --version
 ### Subir o cluster
 
 > ⚠️ Executar o terminal como **Administrador**.
+> Requer o plugin `vagrant-reload` (ver [2.1](#21-plugin-vagrant-reload-obrigatório)). Se ainda não instalou:
+> `vagrant plugin install vagrant-reload`
 
 ```powershell
 cd <caminho-do-projeto>
