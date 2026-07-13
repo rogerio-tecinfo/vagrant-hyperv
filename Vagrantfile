@@ -46,6 +46,13 @@ WORKERS = [
 BOX_IMAGE = "generic/ubuntu2204"
 # =========================================================
 
+# Plugin necessário para o reboot automático após o common.sh.
+# O reload aplica o novo machine-id / dhcp-identifier=mac no eth0, garantindo
+# que cada VM receba uma lease DHCP única (evita worker-2 com o mesmo IP do eth0).
+unless Vagrant.has_plugin?("vagrant-reload")
+  raise "Plugin 'vagrant-reload' é obrigatório. Instale com: vagrant plugin install vagrant-reload"
+end
+
 Vagrant.configure("2") do |config|
   config.vm.synced_folder ".", "/vagrant", disabled: true
   config.vm.boot_timeout = 600  # 10 min - VMs com 1GB podem demorar
@@ -102,6 +109,9 @@ Vagrant.configure("2") do |config|
     # common.sh recebe: versão do K8s + IP fixo do plano de cluster
     master.vm.provision "shell", path: "scripts/common.sh",
       args: [K8S_VERSION, CONTROL_PLANE[:cluster_ip], CLUSTER_NETMASK]
+    # Reboot para aplicar machine-id/dhcp-identifier únicos (lease única no eth0)
+    # antes de inicializar o cluster.
+    master.vm.provision :reload
     # control-plane.sh recebe: IP fixo (advertise) + token fixo
     master.vm.provision "shell", path: "scripts/control-plane.sh",
       args: [CONTROL_PLANE[:cluster_ip], JOIN_TOKEN]
@@ -158,6 +168,9 @@ Vagrant.configure("2") do |config|
 
       worker.vm.provision "shell", path: "scripts/common.sh",
         args: [K8S_VERSION, worker_config[:cluster_ip], CLUSTER_NETMASK]
+      # Reboot para aplicar machine-id/dhcp-identifier únicos (lease única no eth0)
+      # antes de fazer o join no cluster.
+      worker.vm.provision :reload
       # worker.sh recebe: IP fixo do control-plane + token fixo
       worker.vm.provision "shell", path: "scripts/worker.sh",
         args: [CONTROL_PLANE[:cluster_ip], JOIN_TOKEN]
