@@ -22,8 +22,19 @@ O cluster usa **duas interfaces** por VM, separando os planos de tráfego:
 
 | Interface | Switch                  | Faixa            | Uso |
 |-----------|-------------------------|------------------|-----|
-| `eth0`    | LOCAL_NETWORK (DHCP)    | dinâmica         | **Management** — SSH / Vagrant |
+| `eth0`    | LOCAL_NETWORK (estático)| 192.168.15.0/24  | **Management** — SSH / Vagrant / internet |
 | `eth1`    | K8sSwitch (Internal)    | 172.30.0.0/24    | **Cluster** — API server (6443), kubelet, join |
+
+IPs de management (eth0):
+
+| VM | IP (eth0) |
+|----|-----------|
+| control-plane | 192.168.15.10 |
+| worker-1 | 192.168.15.11 |
+| worker-2 | 192.168.15.12 |
+
+> Ajustar `mgmt_ip`, `MGMT_GATEWAY` e `MGMT_DNS` no Vagrantfile conforme sua rede local.
+> Os IPs de management devem estar **fora do pool DHCP** do roteador.
 
 - **Pod CIDR:** `10.244.0.0/16` (Calico) — sem sobreposição com a rede de nós nem com o Service CIDR.
 - **Service CIDR:** `10.96.0.0/12` (padrão kubeadm).
@@ -56,8 +67,8 @@ https://developer.hashicorp.com/vagrant/install
 
 #### 2.1 Plugin `vagrant-reload` (obrigatório)
 
-O provisioning reinicia cada VM após o `common.sh` para aplicar uma identidade de
-rede única no `eth0` (ver [Rede](#rede-segregação-de-planos)). Esse reboot é feito
+O provisioning reinicia cada VM após o `fix-dhcp-identity.sh` para aplicar o IP
+estático na eth0 (ver [Rede](#segregação-de-rede)). Esse reboot é feito
 pelo plugin `vagrant-reload`:
 
 ```powershell
@@ -128,12 +139,12 @@ vagrant up --provider=hyperv
 As interfaces já vêm fixadas nos vSwitches (`LOCAL_NETWORK` e `K8sSwitch`) — sem prompt de seleção.
 
 O provisioning executa automaticamente:
-1. Configura o IP fixo do plano de cluster (eth1 / K8sSwitch) via netplan
-2. Regenera o `machine-id` e fixa `dhcp-identifier: mac` no eth0 (lease DHCP única por VM)
-3. Configura pré-requisitos do sistema (swap, módulos, sysctl)
-4. Instala containerd 1.7.22 com systemd cgroup driver
-5. Instala kubeadm, kubelet e kubectl v1.30.14
-6. **Reinicia a VM** (via `vagrant-reload`) para aplicar a identidade de rede única antes de subir/entrar no cluster
+1. Configura IP **estático** na eth0 (management) via `fix-dhcp-identity.sh`
+2. **Reinicia a VM** (via `vagrant-reload`) para aplicar o IP estático único
+3. Configura o IP fixo do plano de cluster (eth1 / K8sSwitch) via netplan
+4. Configura pré-requisitos do sistema (swap, módulos, sysctl)
+5. Instala containerd 1.7.22 com systemd cgroup driver
+6. Instala kubeadm, kubelet e kubectl v1.30.14
 7. Inicializa o cluster no control-plane (`kubeadm init` com Pod CIDR `10.244.0.0/16`)
 8. Instala o CNI Calico v3.27.0 (alinhado ao Pod CIDR)
 9. Aplica as NetworkPolicies (default-deny + allow DNS)
@@ -230,6 +241,7 @@ vagrant destroy worker-1 -f && vagrant up worker-1 --provider=hyperv
 ├── manifests/
 │   └── network-policies.yaml    # NetworkPolicies (default-deny + allow DNS)
 └── scripts/
+    ├── fix-dhcp-identity.sh     # IP estático na eth0 (roda antes do reload)
     ├── common.sh                # IP fixo (eth1) + pré-requisitos + containerd + kubeadm
     ├── control-plane.sh         # kubeadm init + Calico + NetworkPolicies (control-plane)
     ├── worker.sh                # kubeadm join determinístico (workers)
@@ -242,7 +254,7 @@ vagrant destroy worker-1 -f && vagrant up worker-1 --provider=hyperv
 ## Observações sobre Hyper-V + Kubernetes
 
 ### Rede (segregação de planos)
-- **eth0** (LOCAL_NETWORK/DHCP) = management: SSH/Vagrant e saída para a internet.
+- **eth0** (LOCAL_NETWORK/estático) = management: SSH/Vagrant e saída para a internet.
 - **eth1** (K8sSwitch/Internal, `172.30.0.0/24`, estático) = plano de cluster: API server, kubelet e join.
 - O `node-ip` do kubelet é fixado na eth1 (`--node-ip`), garantindo que o `InternalIP` dos nós fique na rede de cluster.
 
@@ -251,19 +263,16 @@ vagrant destroy worker-1 -f && vagrant up worker-1 --provider=hyperv
 As VMs são *linked clones* da mesma box, então herdam o mesmo `/etc/machine-id`.
 O `systemd-networkd` deriva o **DUID** de DHCP a partir do `machine-id`; com o DUID
 igual, o servidor DHCP tratava VMs diferentes como o mesmo cliente e entregava a
-**mesma lease** — p. ex. `worker-2` acabava com o mesmo IP de `eth0` de outro nó,
-quebrando o acesso SSH/Vagrant a esse worker (o plano de cluster no `eth1` é
-estático e nunca foi afetado).
+**mesma lease** — independente do MAC ser diferente.
 
-Defesa dupla, aplicada pelo `common.sh` (idempotente):
-1. **Regenera o `machine-id`** (uma vez por VM) → identidade de DHCP única.
-2. **Fixa `dhcp-identifier: mac` no eth0** → como o Hyper-V atribui MAC único por
-   adapter, a lease fica determinística mesmo que algum DUID coincida.
+**Solução adotada:** IP estático na eth0 (definido no Vagrantfile), eliminando
+totalmente a dependência de DHCP. O script `fix-dhcp-identity.sh`:
+1. **Regenera o `machine-id`** (boa prática para identidade única).
+2. **Remove** configs netplan da box e desabilita cloud-init network.
+3. **Cria netplan** com IP estático (ex: `192.168.15.11/24` + gateway + DNS).
 
-Como a lease do `eth0` é obtida no boot (antes do provisioning), o `Vagrantfile`
-executa um **`vagrant reload` automático** logo após o `common.sh` (via plugin
-`vagrant-reload`): a VM reinicia com a nova identidade e renova o IP antes de
-subir/entrar no cluster. Assim, um único `vagrant up` já sai determinístico.
+O `Vagrantfile` executa um **`vagrant reload`** logo após o `fix-dhcp-identity.sh`:
+a VM reinicia com o IP estático único antes de subir/entrar no cluster.
 - **Pod CIDR:** `10.244.0.0/16` (Calico, alinhado ao `--pod-network-cidr`). Evita a colisão que ocorria com `192.168.0.0/16` vs. a faixa do vSwitch de management.
 - **Service CIDR:** `10.96.0.0/12` (padrão do kubeadm).
 
