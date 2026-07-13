@@ -65,8 +65,64 @@ kubeadm join "${CONTROL_PLANE_IP}:${API_PORT}" \
   --discovery-token-unsafe-skip-ca-verification \
   --ignore-preflight-errors=Mem
 
+# -------------------------------------------
+# 3. Validação pós-join
+# -------------------------------------------
+echo ""
+echo ">>> Validando worker $(hostname)..."
+
+VALIDATION_ERRORS=0
+validate() {
+  local desc="$1"
+  local cmd="$2"
+  if eval "$cmd" > /dev/null 2>&1; then
+    echo "  [OK] $desc"
+  else
+    echo "  [FALHOU] $desc"
+    ((VALIDATION_ERRORS++)) || true
+  fi
+}
+
+# Detectar interface do cluster (mesma lógica do common.sh)
+CLUSTER_IFACE=""
+for iface in $(ls /sys/class/net/ | grep -v lo); do
+  if ip -4 addr show "$iface" 2>/dev/null | grep -q "172.30.0"; then
+    CLUSTER_IFACE="$iface"
+    break
+  fi
+done
+
+validate "kubelet ativo" "systemctl is-active --quiet kubelet"
+validate "kubelet.conf criado (join concluído)" "test -f /etc/kubernetes/kubelet.conf"
+validate "containerd rodando" "systemctl is-active --quiet containerd"
+validate "IP do cluster atribuído" "test -n '$CLUSTER_IFACE' && ip -4 addr show $CLUSTER_IFACE 2>/dev/null | grep -q '172.30.0'"
+validate "Conectividade com API Server" "timeout 5 bash -c 'echo > /dev/tcp/${CONTROL_PLANE_IP}/${API_PORT}' 2>/dev/null"
+
+# Aguardar node aparecer como registrado (até 30s)
+echo ""
+echo ">>> Aguardando registro do node no cluster (até 30s)..."
+NODE_REGISTERED=false
+for i in $(seq 1 6); do
+  if curl -sk "https://${CONTROL_PLANE_IP}:${API_PORT}/api/v1/nodes/$(hostname)" 2>/dev/null | grep -q '"kind":"Node"'; then
+    NODE_REGISTERED=true
+    break
+  fi
+  sleep 5
+done
+
+if [ "$NODE_REGISTERED" = true ]; then
+  echo "  [OK] Node $(hostname) registrado no cluster"
+else
+  echo "  [FALHOU] Node $(hostname) não aparece no cluster ainda"
+  ((VALIDATION_ERRORS++)) || true
+fi
+
 echo ""
 echo "============================================"
-echo " Worker $(hostname) adicionado ao cluster!"
-echo " IP (plano de cluster): $(ip -4 addr show eth1 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' || echo 'N/A')"
+if [ $VALIDATION_ERRORS -eq 0 ]; then
+  echo " Worker $(hostname): TODOS OS CHECKS PASSARAM"
+else
+  echo " Worker $(hostname): ${VALIDATION_ERRORS} CHECK(S) FALHARAM"
+fi
+echo " IP (cluster): $(ip -4 addr show ${CLUSTER_IFACE:-eth1} 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' || echo 'N/A')"
 echo "============================================"
