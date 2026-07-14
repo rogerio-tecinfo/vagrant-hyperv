@@ -50,8 +50,21 @@ for iface in $(ls /sys/class/net/ | grep -v lo | sort); do
 done
 MGMT_IFACE="${MGMT_IFACE:-eth0}"
 
+# --- Capturar o MAC da NIC de management ---
+# O netplan vai casar por MAC (não por nome). Em linked clones no Hyper-V a
+# ordem de enumeração das NICs pode inverter após o vagrant-reload; casando por
+# MAC o IP estático segue SEMPRE a placa do LOCAL_NETWORK, independente de o
+# kernel chamá-la de eth0 ou eth1.
+MGMT_MAC="$(cat /sys/class/net/${MGMT_IFACE}/address 2>/dev/null || true)"
+MGMT_MAC="$(echo "$MGMT_MAC" | tr 'A-Z' 'a-z')"
+
 echo ">>> Interface de management detectada: ${MGMT_IFACE}"
-echo ">>> MAC: $(cat /sys/class/net/${MGMT_IFACE}/address 2>/dev/null || echo N/A)"
+echo ">>> MAC: ${MGMT_MAC:-N/A}"
+
+if [ -z "$MGMT_MAC" ]; then
+  echo "ERRO: não foi possível determinar o MAC da interface ${MGMT_IFACE}."
+  exit 1
+fi
 
 # --- Regenerar machine-id (para boa prática, evita outros problemas) ---
 if [ ! -f /etc/machine-id.vagrant-regen ]; then
@@ -89,12 +102,19 @@ for dns in "${DNS_ARRAY[@]}"; do
 done
 
 # --- Criar netplan com IP estático na interface de management ---
-echo ">>> Criando netplan com IP estático ${MGMT_IP}/${MGMT_NETMASK} no ${MGMT_IFACE}..."
+# Casamos por MAC (match.macaddress) em vez de por nome de interface. Assim o IP
+# estático adere à NIC física do LOCAL_NETWORK mesmo que o kernel reordene os
+# nomes eth0/eth1 no boot seguinte ao vagrant-reload. A chave 'mgmt0' é apenas
+# um identificador lógico; 'set-name' garante um nome estável para o common.sh.
+echo ">>> Criando netplan (match por MAC ${MGMT_MAC}) com IP estático ${MGMT_IP}/${MGMT_NETMASK}..."
 cat <<EOF > /etc/netplan/98-mgmt-static.yaml
 network:
   version: 2
   ethernets:
-    ${MGMT_IFACE}:
+    mgmt0:
+      match:
+        macaddress: ${MGMT_MAC}
+      set-name: mgmt0
       dhcp4: false
       addresses:
         - ${MGMT_IP}/${MGMT_NETMASK}
@@ -116,9 +136,15 @@ rm -f /var/lib/dhcp/dhclient*.leases 2>/dev/null || true
 rm -f /run/systemd/netif/leases/* 2>/dev/null || true
 rm -f /var/lib/NetworkManager/*.lease 2>/dev/null || true
 
+# --- Aplicar netplan imediatamente (IP estático ativo antes do reboot) ---
+echo ">>> Aplicando netplan (IP estático ativo agora)..."
+netplan apply 2>/dev/null || true
+sleep 2
+
 echo ""
 echo "============================================"
 echo " Pronto. Após reboot (vagrant-reload):"
-echo "   ${MGMT_IFACE} terá IP ${MGMT_IP} (estático)"
+echo "   a NIC ${MGMT_MAC} vira 'mgmt0' com IP ${MGMT_IP} (estático)"
+echo "   IP casado por MAC (imune à reordenação eth0/eth1)"
 echo "   Sem dependência de DHCP"
 echo "============================================"
